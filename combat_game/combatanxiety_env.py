@@ -82,6 +82,9 @@ class SlayTheKingEnv(gym.Env):
     def _extra_skills(self) -> bool:
         return self.state.round_idx >= 3
 
+    def sample_action(self) -> int:
+        return int(self.action_space.sample(mask=self._get_valid_action_mask()))
+
 
     def _intent_to_onehot(self, intent_code: int) -> np.ndarray:
         out = np.zeros(3, dtype=np.float32)
@@ -120,8 +123,10 @@ class SlayTheKingEnv(gym.Env):
         self.state.revealed_intent = 0
         self.state.recon_used_this_turn = False
 
-    def _start_next_round(self):
+    def _start_next_round(self, *, reset_player_hp: bool = False):
         self.state.round_idx += 1
+        if reset_player_hp:
+            self.state.player_hp = 100.0
         self.state.enemy_hp = 100.0
         self._reset_turn_flags_for_new_player_turn()
 
@@ -129,22 +134,8 @@ class SlayTheKingEnv(gym.Env):
         self.state.done = True
         self.state.winner = winner
 
-    # TODO: what should the reward be? hp? or reward by actions?
-    def _rewards(self, prev_player_hp: float, prev_enemy_hp: float, invalid: bool, won_round: bool, won_game: bool, lost_game: bool) -> float:
-        # Dense shaping + sparse terminal bonuses
-        reward = 0.0
-        reward += (prev_enemy_hp - self.state.enemy_hp) * 0.10
-        reward -= (prev_player_hp - self.state.player_hp) * 0.10
-
-        if invalid:
-            reward -= 0.20
-        if won_round:
-            reward += 2.0
-        if won_game:
-            reward += 10.0
-        if lost_game:
-            reward -= 10.0
-        return float(reward)
+    def _rewards(self, won_game: bool) -> float:
+        return 1.0 if won_game else 0.0
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
@@ -166,63 +157,67 @@ class SlayTheKingEnv(gym.Env):
         if self.state.done:
             raise RuntimeError("step() called after episode done. Call reset() first.")
 
-        prev_player_hp = self.state.player_hp
-        prev_enemy_hp = self.state.enemy_hp
-        invalid_action = False
         round_cleared = False
+        round_failed = False
         enemy_intent_name = None
         player_action_name = ACTION_NAMES[action]
 
         valid_mask = self._get_valid_action_mask()
         if valid_mask[action] == 0:
-            invalid_action = True
-        else:
-            # ---- Player turn ----
-            if action == ATTACK:
-                result = self._weighted_pick((("normal", 0.50), ("power", 0.30), ("self", 0.20)))
-                damage = 0.0
+            raise ValueError(
+                f"Action {action} ({player_action_name}) is not available in round {self.state.round_idx}."
+            )
 
-                if result == "normal":
-                    damage = 10.0
-                elif result == "power":
-                    damage = 25.0
-                else:
-                    self.state.player_hp = max(0.0, self.state.player_hp - 10.0)
+        # ---- Player turn ----
+        if action == ATTACK:
+            result = self._weighted_pick((("normal", 0.50), ("power", 0.30), ("self", 0.20)))
+            damage = 0.0
 
-                if self.state.next_attack_boost_armed:
-                    if damage > 0.0:
-                        damage = 25.0
-                    self.state.next_attack_boost_armed = False
+            if result == "normal":
+                damage = 10.0
+            elif result == "power":
+                damage = 25.0
+            else:
+                self.state.player_hp = max(0.0, self.state.player_hp - 10.0)
 
-                if self.state.enemy_defending and damage > 0.0:
-                    damage = round(damage * 0.5)
-
+            if self.state.next_attack_boost_armed:
                 if damage > 0.0:
-                    self.state.enemy_hp = max(0.0, self.state.enemy_hp - damage)
+                    damage = 25.0
+                self.state.next_attack_boost_armed = False
 
-            elif action == DEFEND:
-                self.state.player_defending = True
+            if self.state.enemy_defending and damage > 0.0:
+                damage = round(damage * 0.5)
 
-            elif action == RECON:
-                self.state.player_hp = max(0.0, self.state.player_hp - 5.0)
-                predicted = self._get_enemy_intent_by_hp(self.state.enemy_hp)
-                self.state.revealed_intent = 1 if predicted == "attack" else 2
-                self.state.recon_used_this_turn = True
+            if damage > 0.0:
+                self.state.enemy_hp = max(0.0, self.state.enemy_hp - damage)
 
-            elif action == HEAL:
-                self.state.player_hp = min(100.0, self.state.player_hp + 30.0)
-                # turn ends immediately; no additional player action this step
+        elif action == DEFEND:
+            self.state.player_defending = True
 
-            elif action == BOOST:
-                result = self._weighted_pick((("boost", 0.50), ("penalty", 0.50)))
-                if result == "boost":
-                    self.state.next_attack_boost_armed = True
-                else:
-                    self.state.player_hp = max(0.0, self.state.player_hp - 30.0)
+        elif action == RECON:
+            self.state.player_hp = max(0.0, self.state.player_hp - 5.0)
+            predicted = self._get_enemy_intent_by_hp(self.state.enemy_hp)
+            self.state.revealed_intent = 1 if predicted == "attack" else 2
+            self.state.recon_used_this_turn = True
+
+        elif action == HEAL:
+            self.state.player_hp = min(100.0, self.state.player_hp + 30.0)
+            # turn ends immediately; no additional player action this step
+
+        elif action == BOOST:
+            result = self._weighted_pick((("boost", 0.50), ("penalty", 0.50)))
+            if result == "boost":
+                self.state.next_attack_boost_armed = True
+            else:
+                self.state.player_hp = max(0.0, self.state.player_hp - 30.0)
 
         # if player died from self-cost before enemy turn
         if self.state.player_hp <= 0.0:
-            self._finish_game(winner=2)
+            round_failed = True
+            if self.state.round_idx >= self.max_rounds:
+                self._finish_game(winner=2)
+            else:
+                self._start_next_round(reset_player_hp=True)
         # if enemy died from player action
         elif self.state.enemy_hp <= 0.0:
             round_cleared = True
@@ -232,7 +227,7 @@ class SlayTheKingEnv(gym.Env):
                 self._start_next_round()
 
         # ---- Enemy turn ----
-        elif not invalid_action:
+        else:
             if self.state.revealed_intent == 1:
                 enemy_intent_name = "attack"
             elif self.state.revealed_intent == 2:
@@ -249,25 +244,22 @@ class SlayTheKingEnv(gym.Env):
                 self.state.player_hp = max(0.0, self.state.player_hp - damage)
 
             if self.state.player_hp <= 0.0:
-                self._finish_game(winner=2)
+                round_failed = True
+                if self.state.round_idx >= self.max_rounds:
+                    self._finish_game(winner=2)
+                else:
+                    self._start_next_round(reset_player_hp=True)
 
         won_game = self.state.done and self.state.winner == 1
-        lost_game = self.state.done and self.state.winner == 2
-        reward = self._rewards(
-            prev_player_hp=prev_player_hp,
-            prev_enemy_hp=prev_enemy_hp,
-            invalid=invalid_action,
-            won_round=round_cleared,
-            won_game=won_game,
-            lost_game=lost_game,
-        )
+        reward = self._rewards(won_game=won_game)
 
-        if not self.state.done and not round_cleared:
+        if not self.state.done and not round_cleared and not round_failed:
             self._reset_turn_flags_for_new_player_turn()
 
         self.last_info = {
             "round_cleared": round_cleared,
-            "invalid_action": invalid_action,
+            "round_failed": round_failed,
+            "invalid_action": False,
             "player_action": player_action_name,
             "enemy_intent": enemy_intent_name,
             "winner": self.state.winner,
